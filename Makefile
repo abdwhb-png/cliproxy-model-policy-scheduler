@@ -1,7 +1,7 @@
 PLUGIN_ID := cliproxy-model-policy-scheduler
 OUTPUT := dist/$(PLUGIN_ID).so
 
-.PHONY: fmt test race verify build
+.PHONY: fmt test race vet verify build
 
 fmt:
 	gofmt -w *.go
@@ -12,7 +12,10 @@ test:
 race:
 	go test -race ./...
 
-verify: fmt test race
+vet:
+	go vet ./...
+
+verify: fmt test race vet
 	go mod verify
 
 build:
