@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -14,11 +15,14 @@ const (
 	strategyFillFirst                  = "fill-first"
 	strategyRoundRobin                 = "round-robin"
 	strategyProviderWeightedRoundRobin = "provider-weighted-round-robin"
+	providerGroupByProvider            = "provider"
+	providerGroupByBaseURL             = "base-url"
 	maxProviderWeight                  = 1_000_000
 )
 
 type ruleConfig struct {
 	Strategy        string           `yaml:"strategy"`
+	ProviderGroupBy string           `yaml:"provider-group-by"`
 	ProviderWeights map[string]int64 `yaml:"provider-weights"`
 }
 
@@ -29,13 +33,13 @@ type pluginConfig struct {
 type schedulerPlugin struct {
 	mu                sync.Mutex
 	config            pluginConfig
-	providerCurrent   map[string]map[string]int64
+	groupCurrent      map[string]map[string]int64
 	credentialCursors map[string]map[string]int
 }
 
 func newSchedulerPlugin() *schedulerPlugin {
 	return &schedulerPlugin{
-		providerCurrent:   make(map[string]map[string]int64),
+		groupCurrent:      make(map[string]map[string]int64),
 		credentialCursors: make(map[string]map[string]int),
 	}
 }
@@ -63,9 +67,18 @@ func (p *schedulerPlugin) Reconfigure(raw []byte) error {
 			return fmt.Errorf("model %q has unsupported strategy %q", normalizedModel, rule.Strategy)
 		}
 
+		rule.ProviderGroupBy = strings.ToLower(strings.TrimSpace(rule.ProviderGroupBy))
+		switch rule.ProviderGroupBy {
+		case "", providerGroupByProvider:
+			rule.ProviderGroupBy = providerGroupByProvider
+		case providerGroupByBaseURL:
+		default:
+			return fmt.Errorf("model %q has unsupported provider group %q", normalizedModel, rule.ProviderGroupBy)
+		}
+
 		normalizedWeights := make(map[string]int64, len(rule.ProviderWeights))
 		for provider, weight := range rule.ProviderWeights {
-			normalizedProvider := strings.ToLower(strings.TrimSpace(provider))
+			normalizedProvider := normalizeGroupKey(rule.ProviderGroupBy, provider)
 			if normalizedProvider == "" {
 				return fmt.Errorf("model %q has an empty provider weight key", normalizedModel)
 			}
@@ -86,7 +99,7 @@ func (p *schedulerPlugin) Reconfigure(raw []byte) error {
 
 	p.mu.Lock()
 	p.config = config
-	p.providerCurrent = make(map[string]map[string]int64)
+	p.groupCurrent = make(map[string]map[string]int64)
 	p.credentialCursors = make(map[string]map[string]int)
 	p.mu.Unlock()
 	return nil
@@ -116,7 +129,11 @@ func (p *schedulerPlugin) Pick(request pluginapi.SchedulerPickRequest) pluginapi
 	}
 }
 
-func (p *schedulerPlugin) pickProviderWeightedLocked(model string, rule ruleConfig, candidates []pluginapi.SchedulerAuthCandidate) pluginapi.SchedulerPickResponse {
+func (p *schedulerPlugin) pickProviderWeightedLocked(
+	model string,
+	rule ruleConfig,
+	candidates []pluginapi.SchedulerAuthCandidate,
+) pluginapi.SchedulerPickResponse {
 	if len(candidates) == 0 {
 		return pluginapi.SchedulerPickResponse{Handled: false}
 	}
@@ -124,8 +141,8 @@ func (p *schedulerPlugin) pickProviderWeightedLocked(model string, rule ruleConf
 	bestPriority := 0
 	hasEligible := false
 	for _, candidate := range candidates {
-		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
-		if provider == "" || strings.TrimSpace(candidate.ID) == "" || providerWeight(rule, provider) <= 0 {
+		group := candidateGroup(rule, candidate)
+		if !eligibleCandidate(rule, candidate, group) {
 			continue
 		}
 		if !hasEligible || candidate.Priority > bestPriority {
@@ -137,69 +154,107 @@ func (p *schedulerPlugin) pickProviderWeightedLocked(model string, rule ruleConf
 		return pluginapi.SchedulerPickResponse{Handled: false}
 	}
 
-	byProvider := make(map[string][]pluginapi.SchedulerAuthCandidate)
+	byGroup := make(map[string][]pluginapi.SchedulerAuthCandidate)
 	for _, candidate := range candidates {
-		provider := strings.ToLower(strings.TrimSpace(candidate.Provider))
-		if candidate.Priority != bestPriority || provider == "" || strings.TrimSpace(candidate.ID) == "" || providerWeight(rule, provider) <= 0 {
+		group := candidateGroup(rule, candidate)
+		if candidate.Priority != bestPriority || !eligibleCandidate(rule, candidate, group) {
 			continue
 		}
-		byProvider[provider] = append(byProvider[provider], candidate)
+		byGroup[group] = append(byGroup[group], candidate)
 	}
-	if len(byProvider) == 0 {
+	if len(byGroup) == 0 {
 		return pluginapi.SchedulerPickResponse{Handled: false}
 	}
 
-	providers := make([]string, 0, len(byProvider))
-	for provider := range byProvider {
-		providers = append(providers, provider)
+	groups := make([]string, 0, len(byGroup))
+	for group := range byGroup {
+		groups = append(groups, group)
 	}
-	sort.Strings(providers)
-	for _, provider := range providers {
-		sort.Slice(byProvider[provider], func(i, j int) bool {
-			return byProvider[provider][i].ID < byProvider[provider][j].ID
+	sort.Strings(groups)
+	for _, group := range groups {
+		sort.Slice(byGroup[group], func(i, j int) bool {
+			return byGroup[group][i].ID < byGroup[group][j].ID
 		})
 	}
 
-	current := p.providerCurrent[model]
+	current := p.groupCurrent[model]
 	if current == nil {
 		current = make(map[string]int64)
-		p.providerCurrent[model] = current
+		p.groupCurrent[model] = current
 	}
-	for provider := range current {
-		if _, active := byProvider[provider]; !active {
-			delete(current, provider)
+	for group := range current {
+		if _, active := byGroup[group]; !active {
+			delete(current, group)
 		}
 	}
 
-	selectedProvider := ""
+	selectedGroup := ""
 	var selectedCurrent int64
 	var totalWeight int64
-	for _, provider := range providers {
-		weight := providerWeight(rule, provider)
-		current[provider] += weight
+	for _, group := range groups {
+		weight := groupWeight(rule, group)
+		current[group] += weight
 		totalWeight += weight
-		if selectedProvider == "" || current[provider] > selectedCurrent {
-			selectedProvider = provider
-			selectedCurrent = current[provider]
+		if selectedGroup == "" || current[group] > selectedCurrent {
+			selectedGroup = group
+			selectedCurrent = current[group]
 		}
 	}
-	current[selectedProvider] -= totalWeight
+	current[selectedGroup] -= totalWeight
 
-	providerCursors := p.credentialCursors[model]
-	if providerCursors == nil {
-		providerCursors = make(map[string]int)
-		p.credentialCursors[model] = providerCursors
+	groupCursors := p.credentialCursors[model]
+	if groupCursors == nil {
+		groupCursors = make(map[string]int)
+		p.credentialCursors[model] = groupCursors
 	}
-	providerCandidates := byProvider[selectedProvider]
-	cursor := providerCursors[selectedProvider] % len(providerCandidates)
-	selected := providerCandidates[cursor]
-	providerCursors[selectedProvider] = cursor + 1
+	groupCandidates := byGroup[selectedGroup]
+	cursor := groupCursors[selectedGroup] % len(groupCandidates)
+	selected := groupCandidates[cursor]
+	groupCursors[selectedGroup] = cursor + 1
 
 	return pluginapi.SchedulerPickResponse{AuthID: selected.ID, Handled: true}
 }
 
-func providerWeight(rule ruleConfig, provider string) int64 {
-	if weight, exists := rule.ProviderWeights[provider]; exists {
+func candidateGroup(rule ruleConfig, candidate pluginapi.SchedulerAuthCandidate) string {
+	provider := normalizeGroupKey(providerGroupByProvider, candidate.Provider)
+	if rule.ProviderGroupBy != providerGroupByBaseURL {
+		return provider
+	}
+	baseURL := normalizeGroupKey(providerGroupByBaseURL, candidate.Attributes["base_url"])
+	if baseURL != "" {
+		return baseURL
+	}
+	return provider
+}
+
+func normalizeGroupKey(groupBy, value string) string {
+	trimmed := strings.TrimSpace(value)
+	if groupBy != providerGroupByBaseURL {
+		return strings.ToLower(trimmed)
+	}
+	return normalizeBaseURL(trimmed)
+}
+
+func normalizeBaseURL(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return value
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	return parsed.String()
+}
+
+func eligibleCandidate(
+	rule ruleConfig,
+	candidate pluginapi.SchedulerAuthCandidate,
+	group string,
+) bool {
+	return group != "" && strings.TrimSpace(candidate.ID) != "" && groupWeight(rule, group) > 0
+}
+
+func groupWeight(rule ruleConfig, group string) int64 {
+	if weight, exists := rule.ProviderWeights[group]; exists {
 		return weight
 	}
 	return 1
